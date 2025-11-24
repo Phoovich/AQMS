@@ -3,6 +3,7 @@
 #include <Firebase_ESP_Client.h>
 #include <WiFi.h>
 #include <math.h>
+#include <time.h>  // <<< เพิ่ม: ใช้สำหรับเวลา (NTP)
 
 // ============ WiFi / Firebase CONFIG =================
 
@@ -23,6 +24,11 @@
 FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
+
+// ============ NTP CONFIG (เวลาไทย UTC+7) ======================
+const char *ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 7 * 3600;  // Thailand
+const int daylightOffset_sec = 0;
 
 // ============ Global sensor values (from Node + Gateway) ============
 
@@ -140,8 +146,6 @@ void readMicOnce() {
 
 // =============== HTTP Handler รับค่าจาก Sensor Node ===============
 void handleNodeData() {
-  // ตัวอย่าง URL จาก Node:
-  // /node?temp1=27.1&hum1=60.2&flameAnalog=1234&flameDigital=1
 
   if (server.hasArg("temp1")) {
     g_nodeTemp = server.arg("temp1").toFloat();
@@ -192,6 +196,34 @@ void initFirebase() {
   Serial.println("Firebase initialized.");
 }
 
+// =============== ฟังก์ชัน NTP & Timestamp =====================
+
+// เรียกครั้งเดียวหลังจากต่อ WiFi
+void initTime() {
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("Config NTP time...");
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to obtain time");
+  } else {
+    Serial.println("Time synchronized with NTP.");
+  }
+}
+
+// คืนค่า timestamp แบบ "2025-11-24T17:20:15"
+String getTimestamp() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to obtain time in getTimestamp()");
+    return "unknown_time";
+  }
+
+  char buf[25];
+  strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
 // =============== ส่งข้อมูลขึ้น Firebase =====================
 void sendToFirebaseOnce() {
   if (!Firebase.ready()) {
@@ -199,23 +231,56 @@ void sendToFirebaseOnce() {
     return;
   }
 
-  // ใช้โครงสร้าง path เดียวกับเพื่อนของคุณ
+  // สร้าง timestamp หนึ่งครั้ง ใช้ร่วมกันทุกค่าใน snapshot นี้
+  String ts = getTimestamp();
+  Serial.print("Firebase timestamp: ");
+  Serial.println(ts);
+
+  bool ok = true;
+
   if (!isnan(g_nodeTemp)) {
-    Firebase.RTDB.pushFloat(&fbdo, "/sensors/dht/temperature", g_nodeTemp);
+    String path = "/sensors/dht/temperature/" + ts; // <<< แก้: ใช้ timestamp เป็น key
+    if (!Firebase.RTDB.setFloat(&fbdo, path.c_str(), g_nodeTemp)) {
+      Serial.print("Error temp: "); Serial.println(fbdo.errorReason());
+      ok = false;
+    }
   }
+
   if (!isnan(g_nodeHum)) {
-    Firebase.RTDB.pushFloat(&fbdo, "/sensors/dht/humidity", g_nodeHum);
+    String path = "/sensors/dht/humidity/" + ts; // <<< แก้
+    if (!Firebase.RTDB.setFloat(&fbdo, path.c_str(), g_nodeHum)) {
+      Serial.print("Error hum: "); Serial.println(fbdo.errorReason());
+      ok = false;
+    }
   }
 
-  Firebase.RTDB.pushInt(&fbdo, "/sensors/flame/analog", g_flameAnalog);
-  Firebase.RTDB.pushInt(&fbdo, "/sensors/flame/digital", g_flameDigital);
+  {
+    String path = "/sensors/flame/analog/" + ts; // <<< แก้
+    if (!Firebase.RTDB.setInt(&fbdo, path.c_str(), g_flameAnalog)) {
+      Serial.print("Error flame analog: "); Serial.println(fbdo.errorReason());
+      ok = false;
+    }
+  }
 
-  // ไม่มี photo ใน gateway ตอนนี้ ข้ามไป
-  // Firebase.RTDB.setInt(&fbdo, "/sensors/photo/value", g_photoValue);
+  {
+    String path = "/sensors/flame/digital/" + ts; // <<< แก้
+    if (!Firebase.RTDB.setInt(&fbdo, path.c_str(), g_flameDigital)) {
+      Serial.print("Error flame digital: "); Serial.println(fbdo.errorReason());
+      ok = false;
+    }
+  }
 
-  Firebase.RTDB.pushFloat(&fbdo, "/sensors/sound/db", g_soundDb);
+  {
+    String path = "/sensors/sound/db/" + ts; // <<< แก้
+    if (!Firebase.RTDB.setFloat(&fbdo, path.c_str(), g_soundDb)) {
+      Serial.print("Error sound: "); Serial.println(fbdo.errorReason());
+      ok = false;
+    }
+  }
 
-  Serial.println("Data sent to Firebase.");
+  if (ok) {
+    Serial.println("Data sent to Firebase with timestamp key.");
+  }
 }
 
 // ========================== SETUP =================================
@@ -229,8 +294,13 @@ void setup() {
   i2s_setpin();
   i2s_start(I2S_PORT);
 
-  // WiFi & Firebase
+  // WiFi
   connectWiFi();
+
+  // NTP time
+  initTime();  // <<< ใหม่: sync เวลา ก่อนเริ่ม Firebase
+
+  // Firebase
   initFirebase();
 
   // HTTP Server สำหรับรับจาก Sensor Node
