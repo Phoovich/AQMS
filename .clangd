@@ -1,0 +1,11 @@
+CompileFlags:
+  Add: [
+    -ferror-limit=0,
+    -mlongcalls,
+    -isysroot=/Users/phoovich/.platformio/packages/toolchain-xtensa-esp32/xtensa-esp32-elf,
+  ]
+  Remove: [
+    -mlongcalls,
+    -fno-tree-switch-conversion,
+    -fstrict-volatile-bitfields,
+  ]
