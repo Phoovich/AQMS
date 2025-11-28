@@ -3,70 +3,78 @@
 #include <Firebase_ESP_Client.h>
 #include <WiFi.h>
 #include <math.h>
-#include <time.h>  // <<< เพิ่ม: ใช้สำหรับเวลา (NTP)
+#include <time.h>          // NTP
+#include <WebServer.h>     // HTTP Server
+#include <PubSubClient.h>  // NETPIE MQTT
 
-// ============ WiFi / Firebase CONFIG =================
-
-// 1. WiFi
-#define WIFI_SSID "Phoovich"
+// ============ WiFi CONFIG =================
+#define WIFI_SSID     "Phoovich"      // แก้ให้ตรง WiFi ที่ใช้จริง
 #define WIFI_PASSWORD "aaaaaaaa"
 
-// 2. Firebase Project
-#define API_KEY "AIzaSyDypT8nwRWYF3v32JlCU8l39_v81LuVEus"
-#define DATABASE_URL                                                           \
-  "https://smartairesp32-default-rtdb.asia-southeast1.firebasedatabase.app/"
+// ============ Firebase CONFIG =============
+#define API_KEY        "AIzaSyDypT8nwRWYF3v32JlCU8l39_v81LuVEus"
+#define DATABASE_URL   "https://smartairesp32-default-rtdb.asia-southeast1.firebasedatabase.app/"
 
-// 3. Firebase user login
-#define USER_EMAIL "6733141121@student.chula.ac.th"
-#define USER_PASSWORD "gayass1234"
+#define USER_EMAIL     "6733141121@student.chula.ac.th"
+#define USER_PASSWORD  "gayass1234"
 
-// Firebase objects
 FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
-// ============ NTP CONFIG (เวลาไทย UTC+7) ======================
+// ============ NETPIE / MQTT CONFIG =========
+const char* mqtt_server   = "broker.netpie.io";
+const int   mqtt_port     = 1883;
+const char* mqtt_Client   = "51f7df51-fdd6-4cbd-996f-ef2ae1a04c22";   // Client ID
+const char* mqtt_username = "gEHFUNG6zPXnMpBovNHv4Q9m3xJgyu6J";      // Token
+const char* mqtt_password = "JK8HurWH2SwoAT9VbttrNpDGXUuYkW93";     // Secret
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+char netpieMsg[256];
+
+// ============ NTP CONFIG (เวลาไทย) =========
 const char *ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 7 * 3600;  // Thailand
 const int daylightOffset_sec = 0;
 
-// ============ Global sensor values (from Node + Gateway) ============
-
+// ============ Global sensor values =========
 // ข้อมูลจาก Sensor Node (ส่งมาทาง HTTP)
 float g_nodeTemp = NAN;
 float g_nodeHum = NAN;
-int g_flameAnalog = -1;
-int g_flameDigital = -1;
+int   g_flameAnalog = -1;
+int   g_flameDigital = -1;
 
 // ข้อมูลจากไมค์ INMP441 ที่ Gateway เอง
 float g_soundDb = 0.0;
 
-// สำหรับการยิง Firebase แบบมี interval
+// สำหรับการยิง Firebase/NETPIE แบบ interval
 unsigned long lastFirebaseMillis = 0;
 const unsigned long FIREBASE_INTERVAL = 2000; // ms
+
+unsigned long lastNetpieMillis = 0;
+const unsigned long NETPIE_INTERVAL = 2000;   // ms
 
 // สำหรับการอ่านไมค์ INMP441
 unsigned long lastMicReadMillis = 0;
 const unsigned long MIC_INTERVAL = 500; // ms
 
-// =============== HTTP SERVER (รับจาก Sensor Node) ==================
-#include <WebServer.h>
+// =============== HTTP SERVER (รับจาก Sensor Node) ==============
 WebServer server(80);
 
-// =============== INMP441 I2S Microphone CONFIG =====================
-
-#define I2S_WS 25
-#define I2S_SD 33
+// =============== INMP441 I2S CONFIG ============================
+#define I2S_WS  25
+#define I2S_SD  33
 #define I2S_SCK 32
 
 #define I2S_PORT I2S_NUM_0
 #define BUFFER_LEN 64
 int16_t sBuffer[BUFFER_LEN];
 
-// Calibrate offset (ปรับทีหลังได้)
+// Calibrate offset
 float CALIBRATION_OFFSET_DB = 127.0f;
 
-// ----------------------------------------------------
+// ================== I2S Setup =========================
 void i2s_install() {
   const i2s_config_t i2s_config = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -77,28 +85,35 @@ void i2s_install() {
       .intr_alloc_flags = 0,
       .dma_buf_count = 8,
       .dma_buf_len = BUFFER_LEN,
-      .use_apll = false};
+      .use_apll = false
+  };
   i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
 }
 
 void i2s_setpin() {
-  const i2s_pin_config_t pin_config = {.bck_io_num = I2S_SCK,
-                                       .ws_io_num = I2S_WS,
-                                       .data_out_num = -1,
-                                       .data_in_num = I2S_SD};
+  const i2s_pin_config_t pin_config = {
+      .bck_io_num = I2S_SCK,
+      .ws_io_num = I2S_WS,
+      .data_out_num = -1,
+      .data_in_num = I2S_SD
+  };
   i2s_set_pin(I2S_PORT, &pin_config);
 }
 
-// =============== ฟังก์ชันอ่านค่าไมค์ INMP441 =======================
+// =============== ฟังก์ชันอ่านค่าไมค์ INMP441 ===================
 void readMicOnce() {
   size_t bytesIn = 0;
-  esp_err_t result = i2s_read(I2S_PORT, &sBuffer, BUFFER_LEN * sizeof(int16_t),
-                              &bytesIn, portMAX_DELAY);
+  esp_err_t result = i2s_read(
+      I2S_PORT,
+      &sBuffer,
+      BUFFER_LEN * sizeof(int16_t),
+      &bytesIn,
+      portMAX_DELAY
+  );
 
   if (result == ESP_OK && bytesIn > 0) {
     int samples_read = bytesIn / sizeof(int16_t);
     if (samples_read > 0) {
-
       double sumSquares = 0;
       for (int i = 0; i < samples_read; i++) {
         float sample = (float)sBuffer[i];
@@ -116,37 +131,31 @@ void readMicOnce() {
       }
 
       float dBSPL = dBFS + CALIBRATION_OFFSET_DB;
-
       g_soundDb = dBSPL;
 
-      // แสดงข้อมูลรวม (Gateway + Node)
+      // Debug
       Serial.println("\n===== GATEWAY STATUS =====");
       Serial.printf("INMP441 (Gateway) dB SPL: %.2f\n", g_soundDb);
 
       Serial.print("Node Temp : ");
-      if (isnan(g_nodeTemp))
-        Serial.println("N/A");
-      else
-        Serial.printf("%.2f °C\n", g_nodeTemp);
+      if (isnan(g_nodeTemp)) Serial.println("N/A");
+      else Serial.printf("%.2f °C\n", g_nodeTemp);
 
       Serial.print("Node Hum  : ");
-      if (isnan(g_nodeHum))
-        Serial.println("N/A");
-      else
-        Serial.printf("%.2f %%\n", g_nodeHum);
+      if (isnan(g_nodeHum)) Serial.println("N/A");
+      else Serial.printf("%.2f %%\n", g_nodeHum);
 
       Serial.printf("Flame Analog  : %d\n", g_flameAnalog);
-      Serial.printf("Flame Digital : %d (%s)\n", g_flameDigital,
+      Serial.printf("Flame Digital : %d (%s)\n",
+                    g_flameDigital,
                     g_flameDigital ? "FLAME DETECTED" : "NO FLAME");
-
       Serial.println("===========================");
     }
   }
 }
 
-// =============== HTTP Handler รับค่าจาก Sensor Node ===============
+// =============== HTTP Handler รับค่าจาก Sensor Node =============
 void handleNodeData() {
-
   if (server.hasArg("temp1")) {
     g_nodeTemp = server.arg("temp1").toFloat();
   }
@@ -164,13 +173,14 @@ void handleNodeData() {
   Serial.printf("Temp1: %.2f °C\n", g_nodeTemp);
   Serial.printf("Hum1 : %.2f %%\n", g_nodeHum);
   Serial.printf("Flame Analog : %d\n", g_flameAnalog);
-  Serial.printf("Flame Digital: %d (%s)\n", g_flameDigital,
+  Serial.printf("Flame Digital: %d (%s)\n",
+                g_flameDigital,
                 g_flameDigital ? "FLAME DETECTED" : "NO FLAME");
 
   server.send(200, "text/plain", "Gateway received data from node");
 }
 
-// =============== WiFi & Firebase =====================
+// =============== WiFi / Firebase =====================
 void connectWiFi() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to Wi-Fi");
@@ -196,9 +206,26 @@ void initFirebase() {
   Serial.println("Firebase initialized.");
 }
 
-// =============== ฟังก์ชัน NTP & Timestamp =====================
+// =============== NETPIE MQTT =========================
+void initMQTT() {
+  mqttClient.setServer(mqtt_server, mqtt_port);
+}
 
-// เรียกครั้งเดียวหลังจากต่อ WiFi
+void reconnectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting to NETPIE MQTT… ");
+    if (mqttClient.connect(mqtt_Client, mqtt_username, mqtt_password)) {
+      Serial.println("connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+// =============== NTP & Timestamp ======================
 void initTime() {
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   Serial.println("Config NTP time...");
@@ -211,14 +238,12 @@ void initTime() {
   }
 }
 
-// คืนค่า timestamp แบบ "2025-11-24T17:20:15"
 String getTimestamp() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) {
     Serial.println("Failed to obtain time in getTimestamp()");
     return "unknown_time";
   }
-
   char buf[25];
   strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &timeinfo);
   return String(buf);
@@ -231,7 +256,6 @@ void sendToFirebaseOnce() {
     return;
   }
 
-  // สร้าง timestamp หนึ่งครั้ง ใช้ร่วมกันทุกค่าใน snapshot นี้
   String ts = getTimestamp();
   Serial.print("Firebase timestamp: ");
   Serial.println(ts);
@@ -239,39 +263,35 @@ void sendToFirebaseOnce() {
   bool ok = true;
 
   if (!isnan(g_nodeTemp)) {
-    String path = "/sensors/dht/temperature/" + ts; // <<< แก้: ใช้ timestamp เป็น key
+    String path = "/sensors/dht/temperature/" + ts;
     if (!Firebase.RTDB.setFloat(&fbdo, path.c_str(), g_nodeTemp)) {
       Serial.print("Error temp: "); Serial.println(fbdo.errorReason());
       ok = false;
     }
   }
-
   if (!isnan(g_nodeHum)) {
-    String path = "/sensors/dht/humidity/" + ts; // <<< แก้
+    String path = "/sensors/dht/humidity/" + ts;
     if (!Firebase.RTDB.setFloat(&fbdo, path.c_str(), g_nodeHum)) {
       Serial.print("Error hum: "); Serial.println(fbdo.errorReason());
       ok = false;
     }
   }
-
   {
-    String path = "/sensors/flame/analog/" + ts; // <<< แก้
+    String path = "/sensors/flame/analog/" + ts;
     if (!Firebase.RTDB.setInt(&fbdo, path.c_str(), g_flameAnalog)) {
       Serial.print("Error flame analog: "); Serial.println(fbdo.errorReason());
       ok = false;
     }
   }
-
   {
-    String path = "/sensors/flame/digital/" + ts; // <<< แก้
+    String path = "/sensors/flame/digital/" + ts;
     if (!Firebase.RTDB.setInt(&fbdo, path.c_str(), g_flameDigital)) {
       Serial.print("Error flame digital: "); Serial.println(fbdo.errorReason());
       ok = false;
     }
   }
-
   {
-    String path = "/sensors/sound/db/" + ts; // <<< แก้
+    String path = "/sensors/sound/db/" + ts;
     if (!Firebase.RTDB.setFloat(&fbdo, path.c_str(), g_soundDb)) {
       Serial.print("Error sound: "); Serial.println(fbdo.errorReason());
       ok = false;
@@ -283,11 +303,43 @@ void sendToFirebaseOnce() {
   }
 }
 
-// ========================== SETUP =================================
+// =============== ส่งข้อมูลขึ้น NETPIE =====================
+void sendToNetpieOnce() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+  mqttClient.loop();
+
+  float t  = g_nodeTemp;
+  float h  = g_nodeHum;
+  int   fa = g_flameAnalog;
+  int   fd = g_flameDigital;
+  float sd = g_soundDb;
+
+  // สร้าง JSON ตามรูปแบบ NETPIE
+  String data = "{ \"data\": {";
+  data += "\"Temperature\":"  + String(t, 2)  + ",";
+  data += "\"Humidity\":"     + String(h, 2)  + ",";
+  data += "\"FlameAnalog\":"  + String(fa)    + ",";
+  data += "\"FlameDigital\":" + String(fd)    + ",";
+  data += "\"SoundDb\":"      + String(sd, 2);
+  data += "} }";
+
+  data.toCharArray(netpieMsg, data.length() + 1);
+  mqttClient.publish("@shadow/data/update", netpieMsg);
+
+  Serial.print("NETPIE publish: ");
+  Serial.println(data);
+}
+
+// ========================== SETUP ================================
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("Starting ESP32 GATEWAY (single loop + Firebase)...");
+  Serial.println("Starting ESP32 GATEWAY (Firebase + NETPIE)...");
 
   // I2S สำหรับ INMP441
   i2s_install();
@@ -298,10 +350,13 @@ void setup() {
   connectWiFi();
 
   // NTP time
-  initTime();  // <<< ใหม่: sync เวลา ก่อนเริ่ม Firebase
+  initTime();
 
   // Firebase
   initFirebase();
+
+  // NETPIE MQTT
+  initMQTT();
 
   // HTTP Server สำหรับรับจาก Sensor Node
   server.on("/node", HTTP_GET, handleNodeData);
@@ -309,22 +364,27 @@ void setup() {
   Serial.println("HTTP server started on /node");
 }
 
-// ========================== LOOP ==================================
+// ========================== LOOP =================================
 void loop() {
-  // 1) ให้ Gateway รอรับ HTTP จาก Node
   server.handleClient();
 
   unsigned long now = millis();
 
-  // 2) อ่านค่าไมค์ทุก ๆ MIC_INTERVAL ms
+  // อ่านไมค์ทุก MIC_INTERVAL
   if (now - lastMicReadMillis >= MIC_INTERVAL) {
     lastMicReadMillis = now;
     readMicOnce();
   }
 
-  // 3) ส่งขึ้น Firebase ทุก ๆ FIREBASE_INTERVAL ms
+  // ส่ง Firebase
   if (now - lastFirebaseMillis >= FIREBASE_INTERVAL) {
     lastFirebaseMillis = now;
     sendToFirebaseOnce();
+  }
+
+  // ส่ง NETPIE
+  if (now - lastNetpieMillis >= NETPIE_INTERVAL) {
+    lastNetpieMillis = now;
+    sendToNetpieOnce();
   }
 }
