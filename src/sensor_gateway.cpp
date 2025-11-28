@@ -3,12 +3,14 @@
 #include <Firebase_ESP_Client.h>
 #include <WiFi.h>
 #include <math.h>
-#include <time.h>          // NTP
-#include <WebServer.h>     // HTTP Server
-#include <PubSubClient.h>  // NETPIE MQTT
+#include <time.h>
+#include <WebServer.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <hp_BH1750.h>
 
 // ============ WiFi CONFIG =================
-#define WIFI_SSID     "Phoovich"      // แก้ให้ตรง WiFi ที่ใช้จริง
+#define WIFI_SSID     "Phoovich"
 #define WIFI_PASSWORD "aaaaaaaa"
 
 // ============ Firebase CONFIG =============
@@ -39,14 +41,18 @@ const long gmtOffset_sec = 7 * 3600;  // Thailand
 const int daylightOffset_sec = 0;
 
 // ============ Global sensor values =========
-// ข้อมูลจาก Sensor Node (ส่งมาทาง HTTP)
+// จาก Sensor Node (ส่งมาทาง HTTP)
 float g_nodeTemp = NAN;
 float g_nodeHum = NAN;
 int   g_flameAnalog = -1;
 int   g_flameDigital = -1;
 
-// ข้อมูลจากไมค์ INMP441 ที่ Gateway เอง
+// ไมค์ INMP441 ที่ Gateway
 float g_soundDb = 0.0;
+
+// BH1750 Light sensor ที่ Gateway
+hp_BH1750 lightSensor;
+float g_lightLux = NAN;
 
 // สำหรับการยิง Firebase/NETPIE แบบ interval
 unsigned long lastFirebaseMillis = 0;
@@ -58,6 +64,10 @@ const unsigned long NETPIE_INTERVAL = 2000;   // ms
 // สำหรับการอ่านไมค์ INMP441
 unsigned long lastMicReadMillis = 0;
 const unsigned long MIC_INTERVAL = 500; // ms
+
+// สำหรับ BH1750
+unsigned long lastLightMillis = 0;
+const unsigned long LIGHT_INTERVAL = 200; // ms
 
 // =============== HTTP SERVER (รับจาก Sensor Node) ==============
 WebServer server(80);
@@ -149,6 +159,11 @@ void readMicOnce() {
       Serial.printf("Flame Digital : %d (%s)\n",
                     g_flameDigital,
                     g_flameDigital ? "FLAME DETECTED" : "NO FLAME");
+
+      Serial.print("Light Lux     : ");
+      if (isnan(g_lightLux)) Serial.println("N/A");
+      else Serial.printf("%.2f lux\n", g_lightLux);
+
       Serial.println("===========================");
     }
   }
@@ -176,6 +191,7 @@ void handleNodeData() {
   Serial.printf("Flame Digital: %d (%s)\n",
                 g_flameDigital,
                 g_flameDigital ? "FLAME DETECTED" : "NO FLAME");
+  Serial.println("======================================");
 
   server.send(200, "text/plain", "Gateway received data from node");
 }
@@ -297,6 +313,13 @@ void sendToFirebaseOnce() {
       ok = false;
     }
   }
+  {
+    String path = "/sensors/light/lux/" + ts;
+    if (!Firebase.RTDB.setFloat(&fbdo, path.c_str(), g_lightLux)) {
+      Serial.print("Error light lux: "); Serial.println(fbdo.errorReason());
+      ok = false;
+    }
+  }
 
   if (ok) {
     Serial.println("Data sent to Firebase with timestamp key.");
@@ -318,14 +341,15 @@ void sendToNetpieOnce() {
   int   fa = g_flameAnalog;
   int   fd = g_flameDigital;
   float sd = g_soundDb;
+  float lx = g_lightLux;
 
-  // สร้าง JSON ตามรูปแบบ NETPIE
   String data = "{ \"data\": {";
   data += "\"Temperature\":"  + String(t, 2)  + ",";
   data += "\"Humidity\":"     + String(h, 2)  + ",";
   data += "\"FlameAnalog\":"  + String(fa)    + ",";
   data += "\"FlameDigital\":" + String(fd)    + ",";
-  data += "\"SoundDb\":"      + String(sd, 2);
+  data += "\"SoundDb\":"      + String(sd, 2) + ",";
+  data += "\"LightLux\":"     + String(lx, 2);
   data += "} }";
 
   data.toCharArray(netpieMsg, data.length() + 1);
@@ -339,7 +363,7 @@ void sendToNetpieOnce() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("Starting ESP32 GATEWAY (Firebase + NETPIE)...");
+  Serial.println("Starting ESP32 GATEWAY (Firebase + NETPIE + BH1750)...");
 
   // I2S สำหรับ INMP441
   i2s_install();
@@ -358,6 +382,17 @@ void setup() {
   // NETPIE MQTT
   initMQTT();
 
+  // BH1750 Light Sensor (SDA=21, SCL=22)
+  Wire.begin(21, 22);
+  Serial.println("Starting BH1750...");
+  if (!lightSensor.begin(BH1750_TO_GROUND)) {
+    Serial.println("BH1750 init failed!");
+  } else {
+    Serial.println("BH1750 OK");
+  }
+  lightSensor.calibrateTiming();
+  lightSensor.start();
+
   // HTTP Server สำหรับรับจาก Sensor Node
   server.on("/node", HTTP_GET, handleNodeData);
   server.begin();
@@ -374,6 +409,15 @@ void loop() {
   if (now - lastMicReadMillis >= MIC_INTERVAL) {
     lastMicReadMillis = now;
     readMicOnce();
+  }
+
+  // อ่านแสง BH1750 ทุก LIGHT_INTERVAL
+  if (now - lastLightMillis >= LIGHT_INTERVAL) {
+    lastLightMillis = now;
+    if (lightSensor.hasValue()) {
+      g_lightLux = lightSensor.getLux();
+      lightSensor.start();  // trigger next read
+    }
   }
 
   // ส่ง Firebase
