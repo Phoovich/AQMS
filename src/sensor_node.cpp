@@ -13,6 +13,10 @@ DHT dht(DHTPIN, DHTTYPE);
 #define FLAME_SENSOR_ANALOG_PIN 36   // VP (GPIO36) อ่าน analog
 #define FLAME_SENSOR_DIGITAL_PIN 15  // ขาดิจิทัล
 
+// ----------- Buzzer -----------
+#define BUZZER_PIN 18
+bool buzzerOn = false;
+
 // ====== Wi-Fi ======
 const char* ssid     = "Phoovich";
 const char* password = "aaaaaaaa";
@@ -29,9 +33,13 @@ void setup() {
   // Flame sensor
   pinMode(FLAME_SENSOR_DIGITAL_PIN, INPUT);
 
+  // Buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);    // เริ่มต้นให้เงียบไว้ก่อน
+
   Serial.println("Sensor Node starting...");
   Serial.println(" - DHT11 (KY-015)");
-  Serial.println(" - KY-026 Flame sensor");
+  Serial.println(" - KY-026 Flame sensor + Buzzer");
 
   // Wi-Fi
   WiFi.mode(WIFI_STA);
@@ -72,6 +80,27 @@ void loop() {
   Serial.print(flameAnalog);
   Serial.print(", Digital: ");
   Serial.println(flameDigital);
+
+  // ---------- ควบคุม Buzzer ตามสถานะไฟ ----------
+  // จากโค้ดที่อีกไฟล์คุณใช้: KY-026: HIGH = พบไฟ
+  bool flameDetected = (flameDigital == HIGH);
+
+  if (flameDetected) {
+    // มีไฟ → ให้ส่งเสียง (ถ้ายังไม่เปิด)
+    if (!buzzerOn) {
+      Serial.println("Flame detected! Buzzer ON");
+      tone(BUZZER_PIN, 2000);  // 2 kHz
+      buzzerOn = true;
+    }
+  } else {
+    // ไม่มีไฟ → ให้หยุดเสียง (ถ้ายังเปิดอยู่)
+    if (buzzerOn) {
+      Serial.println("No flame. Buzzer OFF");
+      noTone(BUZZER_PIN);
+      buzzerOn = false;
+    }
+  }
+
   // ---------- ส่ง HTTP ไป Gateway ----------
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
